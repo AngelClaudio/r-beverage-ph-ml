@@ -1,10 +1,11 @@
 ---
 title: "Beverage PH Machine Learning"
 author: "Angel Claudio"
-date: "Semester: Summer 2020"
+date: "August 2020"
 output:
-    toc: yes
-  always_allow_html: true
+  html_document:
+    toc: true
+    toc_float: true
 ---
 
 #####
@@ -550,14 +551,13 @@ Spaces within column names are removed and the variable *Brand Code* is manually
 Data are loaded:
 
 ```{r import-read-excel2}
-
-url <- paste0('https://github.com/AngelClaudio/data-sources/blob/master/excel/StudentEvaluation-%20TO%20PREDICT.xls')
+url <- paste0('https://github.com/AngelClaudio/data-sources/blob/master/',
+              'excel/StudentEvaluation-%20TO%20PREDICT.xls?raw=true')
 
 #X <- read.csv(url)
 download.file(url, "temp_predict.xls", mode = "wb")
   
-pred_data <- read_excel("temp_predict.xls", )
-
+pred_data <- read_excel("temp_predict.xls")
 ```
 
 ### Data Preparation  
