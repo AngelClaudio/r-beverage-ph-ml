@@ -1,0 +1,659 @@
+---
+title: "Beverage PH Machine Learning"
+author: "Angel Claudio"
+date: "Semester: Summer 2020"
+output:
+    toc: yes
+  always_allow_html: true
+---
+
+#####
+
+# Proposal and Goal
+
+The goal of this project is to use a data set from a beverage manufacturing company consisting of 2,571 observations and 33 variables to train a model. The model will be used to predict pH in sample data provided separately.  
+
+
+```{r include=FALSE}
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+library(fpp2)
+library(forecast)
+library(tidyverse)
+library(readxl)
+library(RCurl)
+library(psych)
+library(car)
+library(caret)
+library(VIM)
+library(dplyr)
+library(mice)
+library(seasonal)
+library(fastDummies)
+library(reshape2)
+library(Amelia)
+library(ggplot2)
+library(corrplot)
+library(gbm)
+library(Metrics)
+library(mice)
+library(sjmisc)
+library(xlsx)
+library(parallel)
+library(doParallel)
+library(writexl)
+library(modelr)
+library(rpart)
+library(rpart.plot)
+library(visdat)
+```
+
+# Import Data and EDA (Exploratory Data Analysis)
+
+We will begin by exploring the original data and investigating the type and distribution of all the features available. Due to the nature of this project, scaling and centering is an inappropriate method for model training as the model must be used to predict values in a separate set of provided data. Conversions of the final predictions would be necessary (and impossible to make accurately) with a model trained on centered and scaled data.
+
+## Import Data
+
+***Approach:*** In order to make this a reproducible example, we use the *download.file* function from *utils* to download a public hosted file and read it into memory. To ensure we write the file in binary for use, we set the argument *mode* with value **wb** (writing in binary mode). Since this is an excel file, we use the *read_excel* function from the *readxl* library to read the original data into memory.
+
+```{r import-read-excel}
+url_data <- paste0('https://github.com/AngelClaudio/data-sources/blob/master/',
+            'excel/StudentData%20-%20TO%20MODEL.xls?raw=true')
+
+download.file(url_data, "temp.xls", mode = "wb")
+  
+original_data <- read_excel("temp.xls", )
+```
+
+***Interpretation:*** Running the program will create a local copy of the data on the working directory. There is no dependency on a physical file to run this R Markdown file.
+
+## Initial Look of Data Structure and Content
+
+***Approach:*** We use the base function *str* to explore the structure of the data, data types, data size, and preview some data samples per variable.
+
+```{r explore-data}
+str(original_data)
+```
+
+***Interpretation:*** We can see that all the variables are numeric except `Brand Code`. We'll convert the variable `Brand Code` to *dummy variables* so that it can be quantitative and used for analysis and fitting a model.
+
+## Analysis of Missing Data
+
+***Approach:*** The following code chunk creates a missingness map and bar chart of missing value percentages to investigate whether there are any patterns in the missing values.
+
+```{r missing-values}
+vis_miss(original_data)
+  
+missing.values <- original_data %>%
+  gather(key = "key", value = "val") %>%
+  mutate(isna = is.na(val)) %>%
+  group_by(key) %>%
+  mutate(total = n()) %>%
+  group_by(key, total, isna) %>%
+  summarise(num.isna = n()) %>%
+  mutate(pct = num.isna / total * 100)
+
+
+levels <-
+    (missing.values  %>% filter(isna == T) %>% arrange(desc(pct)))$key
+
+percentage.plot <- missing.values %>%
+      ggplot() +
+        geom_bar(aes(x = reorder(key, desc(pct)), 
+                     y = pct, fill=isna), 
+                 stat = 'identity', alpha=0.8) +
+      scale_x_discrete(limits = levels) +
+      scale_fill_manual(name = "", 
+                        values = c('steelblue', 'tomato3'), labels = c("Present", "Missing")) +
+      coord_flip() +
+      labs(title = "Percentage of Missing Values", x =
+             'Variable', y = "% of missing values")
+
+percentage.plot
+```
+
+***Interpretation:*** MFR has the largest percentage of missing values (about 8%). Since this is a small amount relative to the total size of the dataset, we will use an imputation method to fill all of the missing values.
+
+## Check for Zero Variance
+
+***Approach:*** We want to check variables for near zero variance. We can do this by using the *nearZeroVar* function of the *caret* package.
+
+```{r zero-variance-check}
+nzv <- nearZeroVar(original_data, saveMetrics= TRUE)
+nzv[nzv$nzv,]
+```
+
+***Interpretation:*** We can see that we found *Hyd Pressur1* to be labeled *TRUE* for pre-processing of near-zero variance.
+
+## Checking Correlation
+
+***Approach:*** We use the *corrplot* function to display a graphical correlation matrix.
+
+```{r correlation-analysis}
+corrplot(cor(original_data[,-1], use = "na.or.complete"), type="lower", 
+         order="alphabet", tl.cex=.7)
+```
+
+***Interpretation:*** Overall there seems to be low correlation, but there are some areas of concern. For example, we do see problematic areas with Balling Level and Balling across the Carb Rel, Carb Volume, and Density features.  
+
+## Checking for Outliers and Magnitude
+
+***Approach:*** We use the functions *ggplot* and *geom_boxplot* to identify outliers and the scale of the data. We use *melt* function on the data to pass the data in a long format.
+
+```{r outliers-scale-check}
+ggplot(data = reshape2::melt(original_data) , aes(x=variable, y=value)) + 
+  geom_boxplot(outlier.colour="red", outlier.shape=3, outlier.size=5,
+               aes(fill=variable)) +
+  coord_flip() +
+  theme(legend.position="none")
+```
+
+***Interpretation:*** We can see that the variables Carb Flow, Filler Speed, and MFR have values far exceeding the values of the other variables.
+
+***
+
+# Data Transformation
+
+Now that we have an idea about the data we are working with, we will begin preliminary transformation of the data to prepare for model creation and training.
+
+## Column Transformations
+
+***Approach:*** We first alter the column names by removing spaces using the base function *str_replace* to facilitate general data management. 
+
+```{r initial_data_processing}
+# Remove spaces from all column names
+transformed_data <- original_data
+colnames(transformed_data) <- str_replace(colnames(original_data), '\\s', '')
+colnames(transformed_data)
+```
+
+***Interpretation:*** We can see from the output that all the column names have been cleansed of spaces!
+
+## Handling NAs
+
+***Approach:*** We will drop NAs from the response variable using *drop_na* function.
+
+```{r drop-nas}
+transformed_data <- drop_na(transformed_data, PH)
+```
+
+***Interpretation:*** All of the variables have missing values except for PressureVacuum and AirPressure. The response variable has 4 missing values. These observations are removed from the dataset as they constitute an less than 1% of the sample.
+
+## Handling NZV
+
+***Approach:*** We have identified during our EDA that *Hyd Pressur1* has near-zero variance. However, we will include the near-zero variance variables for the purposes of `gbm` as omission will yield no benefit.
+
+
+```{r preprocessing-data-final}
+data_for_modeling <- transformed_data#[,-which(colnames(transformed_data)=='PH')]
+```
+
+*** 
+## Dummy Variables  
+
+To ensure accuracy, we computed dummy variables manually and removed the categorical variable *BrandCode*:
+
+```{r create-dummy variables, warning=FALSE, message=FALSE}
+data_for_modeling$BrandA <- 0
+data_for_modeling$BrandA[which(data_for_modeling$BrandCode=='A')] <- 1
+data_for_modeling$BrandB <- 0
+data_for_modeling$BrandB[which(data_for_modeling$BrandCode=='B')] <- 1
+data_for_modeling$BrandC <- 0
+data_for_modeling$BrandC[which(data_for_modeling$BrandCode=='C')] <- 1
+data_for_modeling$BrandD <- 0
+data_for_modeling$BrandD[which(data_for_modeling$BrandCode=='D')] <- 1
+data_for_modeling$BrandNA <- 0
+data_for_modeling$BrandNA[which(is.na(data_for_modeling$BrandCode)==TRUE)] <- 1
+
+data_for_modeling$BrandCode <- NULL
+```
+
+## Imputation: `mice` and `parlmice`
+
+There are missing data in both provided datasets; in order to minimize error in the predictions and replicate imputation as closely as possible, `PH` is omitted in the the training data before imputation. We imputed missing data using `mice`, which creates 5 sets of imputed data by default. The *seed* option within the command ensures reproducibility. Density plots for a few imputed variables allows us to assess whether the imputation method is appropriate. We will not remove columns of near-zero variance as they have no detrimental effect on the function of our model.
+
+Due to the amount of processing time involved in the `mice` command, `parlmice` is used to speed processing with the addition of the *n.core* parameter.
+
+```{r mice-imputation, warning = FALSE, message = FALSE}
+td_noPH <- data_for_modeling[,-which(colnames(data_for_modeling)=='PH')]
+
+# -2 CORES FOR SAFETY
+number_of_cores <- detectCores() - 2
+
+# USING PARLMICE INSTEAD TO LEVERAGE PARALLEL PROCESSING
+df2_imp <- parlmice(data = td_noPH, m = 5, method = "pmm",
+                    n.core = number_of_cores, maxit = 50, seed = 500, print = FALSE)
+
+# plot density of imputed values
+plot_merge <- merge_imputations(
+              td_noPH,
+              df2_imp,
+              summary = c("dens"),
+              filter = c("PSCCO2","PCVolume","FillerSpeed","MFR")
+              )
+plot_merge$plot[9]$labels$title = 'Imputed Values vs Final Merged Values'
+plot_merge
+
+```
+
+***Interpretation:*** The plot "shows the distribution of the mean of the imputed values for each variable at each observation. The larger the areas overlap, the better is the fit of the merged value compared to the imputed value." (Source: https://www.rdocumentation.org/packages/sjmisc/versions/2.8.4/topics/merge_imputations)  
+
+According to our EDA, the variables *PSCCO2*, *PCVolume*, *FillerSpeed*, and *MFR* had the highest proportion of missing values and provide the best indication of whether the imputation approach was appropriate. In the plots above, the regions defined by the mean and the merged values overlap exactly, indicating consistency among the imputed values for each observation across all 5 resulting dataframes yielded by imputation. 
+
+This strengthens our confidence in the imputed values. In the code chunk below, the mean of the imputed values across the 5 imputed datasets are appended to the data. The columns with missing data are dropped. This concludes the imputation process. We will replicate this process to impute missing data in the dataset provided for final predictions.
+
+```{r}
+
+NAnames <- names(td_noPH)[sapply(td_noPH, anyNA)]
+td_noPH2 <- td_noPH[,-which(names(td_noPH) %in% NAnames)]
+
+data_for_modeling2 <- merge_imputations(td_noPH,df2_imp,td_noPH2)
+
+data_for_modeling2$PH <- transformed_data$PH
+
+```
+
+## Training and Tuning the Model: Partitioned, Imputed Data  
+
+First, data were partitioned into training and testing dataframes, using 70% of the data to train and 30% of the data to test the model. Testing the model is necessary to assess predictive accuracy.  
+
+```{r}
+set.seed(500) #to get repeatable data
+
+train2 <- sample_frac(data_for_modeling2, 0.7)
+train2_index <- as.numeric(rownames(train2))
+test2 <- data_for_modeling2[-train2_index, ]
+
+y2 <- test2$PH
+
+```
+
+***
+
+# Benchmark Models
+
+We built two Benchmark models (1) Linear Regression - OLS and (2) Decision Tree - Regression. These models will enable us to compare model performance to select the most appropriate for our prediction.
+
+***Approach:*** The first Benchmark model is an ordinary least squares model - the Linear Regression.
+
+The training data has 1797 observations and 37 variables while the test data has 770 observations with 37 variables.
+
+## Linear Regression - OLS
+
+```{r, warning=FALSE, message=FALSE}
+RegModel <-lm(PH ~ ., data = train2)
+summary(RegModel)
+```
+***Interpretation:***
+
+Although we have a significant p-value, the R-squared shows that the model is only accounting for 42% of the variation in the data. 
+
+### Variable Significance
+
+```{r}
+set.seed (124)
+variableimp <- as.data.frame(varImp(RegModel))
+variableimp <- data.frame(overall = variableimp$Overall,
+           names   = rownames(variableimp))
+variableimp[order(variableimp$overall,decreasing = T),]
+```
+
+***Interpretation:***
+
+The variable significance in descending order shows that *MnfFlow*, *CarbPressure1_imp*, *Usagecont_imp*, *HydPressure3_imp*, *BrandB*, *Temperature_imp*, *OxygenFiller_imp*, *BowlSetpoint_imp*, *PressureSetpoint_imp*, *BrandC*, *BallingLvl_imp*,  and *Density* are the top 12 important variables in predicting *PH*. This information will guide us in our subsequent approaches in modeling.
+
+**Please Note:** The '_imp' are suffixes created from the transformation process. These suffixes will be removed prior to calculating the model predictions. 
+
+### Improved Linear Regression - OLS
+
+***Approach:*** 
+
+We will improve the initial OLS using the 12 significant variables identified by the first model to see if the R-squared may improve.
+
+```{r}
+RegModel2 <-lm(PH ~ MnfFlow + CarbPressure1_imp + Usagecont_imp + HydPressure3_imp + BrandB + Temperature_imp + OxygenFiller_imp + BowlSetpoint_imp + PressureSetpoint_imp + BrandC + BallingLvl_imp + Density, data = train2)
+summary(RegModel2)
+```
+
+### Performance Metrics - OLS
+
+```{r}
+OLSMetrics <- data.frame(
+  R2 = rsquare(RegModel2, data = train2),
+  RMSE = rmse(RegModel2, data = train2),
+  MAE = mae(RegModel2, data = train2)
+)
+print(OLSMetrics)
+```
+
+***Interpretation:***
+
+Although the RMSE and the MAE are low, the improved model using the 12 significant variables did not improve the R-squared as can been seen from the performance metrics above.  
+
+## Decision Tree - Regression
+
+The next Benchmark model is the Decision Tree - Regression Tree using the same variables.
+
+***Approach:***
+
+We will use the `rpart` library for the decision tree and try to identify any significant variables in building the tree.
+
+```{r}
+Decisiontree <- rpart(PH ~., method = "anova", data = train2) 
+
+printcp(Decisiontree) # display the results
+```
+
+
+***Interpretation:***
+
+The decison tree identified the following variables as significant for building the tree: *AirPressurer*, *AlchRel_imp*, *BowlSetpoint_imp*, *BrandC*, *CarbPressure1_imp*, *CarbRel_imp*, *HydPressure3_imp*, *MnfFlow*, *OxygenFiller_imp*, *PressureVacuum*, *Temperature_imp* and *Usagecont_imp*. The "_imp" suffix denotes variables that have imputed values.
+
+The root node error is about 3% which means that the splitting at the root node is 97% accurate.
+
+### Visualize cross-validation results
+
+```{r}
+plotcp(Decisiontree)
+```
+
+***Interpretation:***
+
+As the complexity parameter (CP) decreases, we can see that the relative errors equally decrease.
+
+### Plot the Tree
+
+```{r}
+rpart.plot(Decisiontree, extra = "auto",fallen.leaves = TRUE, box.palette = "auto")
+```
+
+***Interpretation:***
+
+From the plot of the Regression Tree, we can see the the splitting started from the Root Node, *MnfFlow*, as the most significant variable for predicting *PH* followed by *AlchRel* and *BrandC*. 
+
+Although the Decision Tree is easy to understand and interpret, they are prone to overfitting. That's why other tree based models such as Random Forest and Gradient Boosting are preferred.
+
+***
+
+# Gradient Boost Modeling: `gbm`  
+
+One of the fundamental reasons for Gradient Boost Modeling was to solve the overfitting issue of decision tree. GBM avoids overfitting by attempting to automatically select the inflection point where performance on the test dataset starts to decrease while performance on the training dataset continues to improve (Singh, 2018). 
+
+In the context of GBM, early stopping can be based either on an out of bag sample set (“OOB”) or cross-validation (“CV”). To avoid overfitting, the GBM stops training the model when the validation error has decreased and stabilized right before the error starts to increase. 
+
+The biggest motivations of using Gradient Boosting is that it allows us to optimize a specified cost function, instead of a loss function that usually offers less control and does not essentially correspond with real world applications.
+
+## Strategy
+
+***Approach:*** We used 70% of the training data provided to train several different models; accuracy of each model was tested against the remaining 30% of the training data. Ordinary linear regression using the `lm` command was least accurate. Among `caretEnsemble` methods, only `rpart` (recursive partitioning) and `svmRadial` (support vector machines) provided satisfactory predictions, though tuning of those models did not outperform the tuned 'glm' model. 
+
+We include the code and results for the tuned 'glm' model below. Once the model is tuned to optimize accuracy in the imputed and partitioned test data, the final model is trained on the entire imputed dataset. We then impute missing data in the data provided for submission and run the final model on the imputed submission data to make our final predictions.
+
+
+The following code chunk trains the model. Tuning is accomplished by employing `caret` to train the model using a range of values for each parameter. The *method* parameter is set to compare values using the repeated cross-validation method (*"repeatedcv"*) and repeat each run 5 times with 5 iterations. Values that yielded the least Root Mean Squared Error (RMSE) were selected. 
+
+This process is exceedingly lengthy and the individual steps are omitted with the final values included in the code below. First, interaction depth (*interaction.depth*), which signifies the overall number of divisions within the data, is tested with other values set as default. 
+
+Each division represents a layer of clustered data for which the model fit did not meet a threshold of accuracy in the node, or cluster, before it. Tuning proceeds with another parameter, *n.minobsinnode*, which sets the minimum number of observations per node. Once this value is tested over a range of values and the value yielding the best RMSE is selected, tuning continues in a rhythm. 
+
+The number of trees (*n.trees*), or the number of versions of the modeling trees, is selected after testing various values. Tuning is concluded with the *shrinkage* parameter, which signifies the learning rate. In order to speed the tuning process, the *bag.fraction* parameter maintains value at 0.8, which indicates the random sample size of the data used to train the model on each iteration. 
+
+The final values of the parameters are shown in the code below. The code below can take up to 173.92 seconds to run, or `r 173.92/60` minutes. Processing speed is increased using the `registerDoParallel` command.   
+
+```{r tune-fit-model, warning = FALSE, message = FALSE}
+cl <- makeCluster(number_of_cores)
+registerDoParallel(cl)
+
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated ten times
+                           repeats = 5)
+
+gbmGrid <-  expand.grid(interaction.depth = 32,#seq(26,36,by=2),#3, 
+                        n.trees = 500,#seq(990,1040,by=5), 
+                        shrinkage = 0.1,#seq(0.01,0.1,by=0.01),
+                        n.minobsinnode = 10)#seq(5,15,by=2))
+set.seed(500)
+system.time(gbmFit2 <- train(PH ~ ., data = train2, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 bag.fraction = 0.8,
+                 ## This last option is actually one
+                 ## for gbm() that passes through
+                 verbose = FALSE,
+                 tuneGrid = gbmGrid)
+)
+gbmFit2
+
+```
+***Interpretation:*** The values of RMSE and R-squared are optimized with the tuning process described above. The parameters listed in the output repesent the final values we will use to make our predictions. With the model tuned, predictive accuracy must be assessed in the partitioned test data.  
+
+The code chunk below plots predicted values vs actual values in the partitioned training data. Axes are limited to maximum and minimum values.  
+
+```{r plot_trainingModel}
+
+yhat_train2 <- predict(gbmFit2, newdata = train2[,-which(colnames(train2)=='PH')], type = 'raw')
+
+plot_df_train2 <- as.data.frame(cbind(predicted = yhat_train2,actual = train2$PH))
+
+ggplot(plot_df_train2, aes(actual, predicted)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("Predicted vs Actual, Partitioned Training Data, GBM") +
+  ylim(min(plot_df_train2$predicted),max(plot_df_train2$predicted)) +
+  xlim(min(plot_df_train2$actual),max(plot_df_train2$actual))
+
+```
+
+***Interpretation:*** The values align beautifully, but we will check the residuals in the testing data below for potential overfitting.  
+
+## Model Assessment  
+
+***Approach:*** Using the data provided, how accurate are our predictions? The code chunk below assesses various metrics of the predicted values the model yields. When combined with model tuning, parameters can be adjusted to optimize the result. Commands included in the `Metrics` package are used in the code chunk below. We compare predicted values with observed values in the partitioned test data with calculations of general mean difference, the proportion of exact matches after rounding, SMAPE, and RMSE. 
+
+```{r}
+
+# test 2
+yhat_t2 <- predict(gbmFit2, newdata = test2, type = 'raw')
+fit_t2 <- data.frame(cbind(yhat_t2,y2))
+fit_t2$rnd_yhat <- round(fit_t2$yhat_t2,2)
+fit_t2$error <- abs(fit_t2$yhat_t2-fit_t2$y2)
+cat("mean error: ",mean(fit_t2$error),"\n")
+cat("exact matches, accuracy: ",accuracy(y2,fit_t2$rnd_yhat),"\n")
+cat("SMAPE: ",smape(y2,yhat_t2),"\n")
+cat("RMSE: ",Metrics::rmse(y2,yhat_t2))
+
+```
+
+***Interpretation:*** The mean difference is quite low, with nearly 71% of *PH* values correctly predicted. RMSE is also quite low. Such a result is the product of careful model tuning. The code chunk below plots predicted values vs actual values. The x and y axes are limited to the maximum and minimum of the actual and predicted values of teh training data for appropriate comparison.  
+
+```{r plot_testingModel}
+
+fit_test2 <- data.frame(cbind(predicted=yhat_t2,actual=y2))
+
+ggplot(fit_test2, aes(actual, predicted)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("Predicted vs Actual, Partitioned Testing Data, GBM") +
+  ylim(min(plot_df_train2$predicted),max(plot_df_train2$predicted)) +
+  xlim(min(plot_df_train2$actual),max(plot_df_train2$actual))
+
+```
+
+***Interpretation:*** Predicted values are evenly distributed about the implied line of regression, indicating symmetry in the residuals and adequate model fit in the testing data. We can proceed with training a new model with the same parameters on the entire set of training data.  
+
+## Training the Model: All Provided Imputed Data 
+
+***Approach:*** With the model optimized we'll train our model with the optimal parameter values selected above on the entire dataset provided and prepare to make our final predictions. 
+
+First, we'll need to ensure that the columns are appropriately named and remove the *'_imp'* suffix from the imputed columns. This suffix is added by default to imputed variables by the `mice` function. The column names must match the names in the submission data in order for the model to run and make predictions.
+
+```{r train-model}
+
+data_for_modeling3 <- data_for_modeling2
+colnames(data_for_modeling3) <- str_replace(colnames(data_for_modeling2), '_imp', '')
+
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated ten times
+                           repeats = 5)
+
+gbmGrid <-  expand.grid(interaction.depth = 32,#seq(26,36,by=2),#3, 
+                        n.trees = 500,#seq(990,1040,by=5), 
+                        shrinkage = 0.1,#seq(0.01,0.1,by=0.01),
+                        n.minobsinnode = 10)#seq(5,15,by=2))
+set.seed(500)
+system.time(gbmFit_Final <- train(PH ~ ., data = data_for_modeling3, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 bag.fraction = 0.8,
+                 ## This last option is actually one
+                 ## for gbm() that passes through
+                 verbose = FALSE,
+                 tuneGrid = gbmGrid)
+)
+gbmFit_Final
+
+```
+
+***Interpretation:*** The RMSE is slightly less than the model run on the partitioned data. Though unanticipated, this result indicates a slightly better model fit. The R-squared value, also a slight improvement of around 0.05, is optimized and adequate for our purposes.  
+
+The following code chunk plots the predicted values versus the actual values in the final model.  
+
+```{r plot_finalModel}
+
+yhat_dfm3 <- predict(gbmFit_Final, newdata = data_for_modeling3[,-which(colnames(data_for_modeling3)=='PH')], type = 'raw')
+
+plot_df <- as.data.frame(cbind(predicted = yhat_dfm3,actual = data_for_modeling3$PH))
+
+ggplot(plot_df, aes(actual, predicted)) +
+  geom_point() +
+  theme_minimal() +
+  ggtitle("Predicted vs Actual, Final GBM")
+
+```
+
+***Interpretation:*** The model performs very well, though there could be a danger of overfitting. Residuals, however are uniformly distributed. We'll proceed with the predictions.  
+
+***  
+
+## Predicting pH: The Final Steps  
+
+***Approach:*** The Excel spreadsheet provided from which we must make our predictions was uploaded to GitHub in a public reposititory. The code chunk below loads the data and returns a dataframe. 
+
+Spaces within column names are removed and the variable *Brand Code* is manually dummy-coded. Imputation using `mice` follows as before, with the resulting imputed data added to the dataframe. Columns with missing data are dropped and the *'_imp'* suffix removed from the column titles.  
+
+### Import Data: Data Provided for Prediction and Submission  
+
+Data are loaded:
+
+```{r import-read-excel2}
+
+url <- paste0('https://github.com/AngelClaudio/data-sources/blob/master/excel/StudentEvaluation-%20TO%20PREDICT.xls')
+
+#X <- read.csv(url)
+download.file(url, "temp_predict.xls", mode = "wb")
+  
+pred_data <- read_excel("temp_predict.xls", )
+
+```
+
+### Data Preparation  
+
+In the code chunk below, spaces are removed from column names and *Brand Code* is dummy-coded. Data are imputed using the method employed earlier in this document. The resulting imputed data are merged with the data provided for submission. Processing time is lengthy, but the result is worth the wait.
+
+```{r predict-data, warning = FALSE, message = FALSE}
+
+tpred_data <- pred_data
+colnames(tpred_data) <- str_replace(colnames(pred_data), '\\s', '')
+
+tpred_data$BrandA <- 0
+tpred_data$BrandA[which(tpred_data$BrandCode=='A')] <- 1
+tpred_data$BrandB <- 0
+tpred_data$BrandB[which(tpred_data$BrandCode=='B')] <- 1
+tpred_data$BrandC <- 0
+tpred_data$BrandC[which(tpred_data$BrandCode=='C')] <- 1
+tpred_data$BrandD <- 0
+tpred_data$BrandD[which(tpred_data$BrandCode=='D')] <- 1
+tpred_data$BrandNA <- 0
+tpred_data$BrandNA[which(is.na(tpred_data$BrandCode)==TRUE)] <- 1
+
+# set aside BrandCode
+BrandCode <- tpred_data$BrandCode
+tpred_data$BrandCode <- NULL
+
+tpred_noPH <- tpred_data[,-which(colnames(tpred_data)=='PH')]
+
+# USING PARLMICE INSTEAD TO LEVERAGE PARALLEL PROCESSING
+pred_imp <- parlmice(data = tpred_noPH, m = 5, method = "pmm",
+                    n.core = number_of_cores, maxit = 50, seed = 500, print = FALSE)
+
+
+NAnames <- names(tpred_noPH)[sapply(tpred_noPH, anyNA)]
+tpred_noPH2 <- tpred_noPH[,-which(names(tpred_noPH) %in% NAnames)]
+
+data_for_predicting <- merge_imputations(tpred_noPH,pred_imp,tpred_noPH2)
+
+```
+
+### Predict
+
+Finally, we make our predictions. Again, we'll remove the '_imp' suffix before running the model.  
+
+```{r predict_final}
+
+data_for_predicting2 <- data_for_predicting
+colnames(data_for_predicting2) <- str_replace(colnames(data_for_predicting), '_imp', '')
+data_for_predicting3 <- data_for_predicting2[colnames(data_for_modeling3[,-which(colnames(data_for_modeling3)=='PH')])]
+
+# test 2
+PH <- predict(gbmFit_Final, newdata = data_for_predicting3, type = 'raw')
+data_for_predicting3$PH <- PH
+pred_data$PH <- PH
+
+```
+
+### Construct Submission  
+
+The code chunk below creates an Excel workbook with two spreadsheets in the working directory, Predicted values are merged with the imputed data in a sheet entitled "PH_IMputedData". Predicted values are merged with the original data in a sheet entitled "PH_OriginalData". Due to the mixed variable types in the original dataframe the package `writexl` is used; these original data include the string variable *Brand Code* as provided. Predicted values without rounding are recorded to miminize error.  
+
+```{r write_Excel}
+
+library(writexl)
+
+PH_OriginalData <- pred_data
+PH_ImputedData <- data_for_predicting3
+
+write_xlsx(x=list(PH_OriginalData = PH_OriginalData, PH_ImputedData = PH_ImputedData), path = "StudentEvaluation_TO_PREDICT.xlsx")
+
+```
+
+***
+
+# Conclusion  
+
+The Linear Regression - OLS model only accounted for 40% of the variation in the data which makes Ordinary Linear Regression unfit for our prediction purposes.
+
+The Decision Tree is used in regression problems if and only if the target variable is inside the range of values in the training dataset.
+
+Decision Trees may be unfit for continuous variables such as the dependent variable (*PH*) in our dataset; a small variation in data may lead to a completely different tree being generated. Despite the limitations of Decision Tree, it helps to see the splits based on the variable importance. 
+
+However, we could not depend on the Decision Tree due to the nature of our dependent variable and the tendency to overfit. Hence, we used an improved tree-based Gradient Boost Model (GBM) which is more appropriate for our dependent variable and handle the overfitting tendency of the Decision Tree.
+
+Training and tuning a Gradient Boost Model requires time to experiment, but the results are worth the effort. Due to the predictive power of the model, we were able to exactly match 71% of the pH values in during testing. Further, formulating a strategy to impute missing data necessitated a comprehensive overview of all elements involved with little knowledge of the variables involved or the guaranteed success of a specific approach. Trial and error was key. 
+
+Centering and scaling, while a good approach, could not be performed equally (and automatically) in two separate sets of data. Reproducibility in data cleaning and was also critical. 
+
+Missing data had to be imputed consistently to optimize model performance. Despite the complexities, the accuracy of the model yielded satisfactory results. May the RMSE forever be in our favor.
+
+
+# Reference
+
+Singh, H. (2018). Understanding Gradient Boosting Machines. Retrieved from https://towardsdatascience.com/understanding-gradient-boosting-machines-9be756fe76ab
+
+
+
+
+
